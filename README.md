@@ -2,6 +2,8 @@
 
 A clean room reverse engineering project of the official `Xbox MN-740 Wireless Bridge`, specifically how it interacts with the Xbox's dashboard. The original goal was to look for a juicy buffer overflow on the Xbox side, but since there weren't any, those results can still be used for educational purposes.
 
+![](cover_image.jpg)
+
 ## Contents
 
 This repo currently contains the following bits:
