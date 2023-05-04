@@ -8,6 +8,7 @@ A clean room reverse engineering project of the official `Xbox MN-740 Wireless B
 
 This repo currently contains the following bits:
  - A more-or-less working emulator of the wireless adapter, works both with a real Xbox and Xemu;
+ - An incomplete [description](communication_protocol.md) of the communication protocol between the console and the wireless adapter;
  - Debug symbols for the `xonlinedash.xbe` version `185ead00 (MD5: 8149654a030d813bcc02a24f39fd3ce9)` in a form of Ghidra XML that I reacreated (or should I say guessed?) in the process.
 
 ## Emulator how-to
