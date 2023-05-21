@@ -104,6 +104,9 @@ def start_server(ifname):
 def send_response(packet_type, nonce, payload, socket, local_mac, destination_mac):
     body_size = calculate_body_size_in_dwords_for_payload(payload)
 
+    if len(payload) < 34: # check wherher the frame has to be padded to 64 bytes in total
+        payload += bytes(34 - len(payload))
+
     body_wo_checksum = HEADER_SIGNATURE + \
                        HEADER_VERSION + \
                        body_size + \
@@ -147,7 +150,7 @@ def respond_to_handshake(packet, socket, local_mac):
 def respond_to_beacon(packet, socket, local_mac):
     print("Trying to respond to the beacon...\n")
 
-    payload = bytes.fromhex("02 80 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00")
+    payload = bytes.fromhex("02 80 00 00")
 
     send_response(PACKET_TYPE_BEACON_RESPONSE, 
                   packet.nonce,
