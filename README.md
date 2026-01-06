@@ -15,11 +15,23 @@ This repo currently contains the following bits:
 
 ### Prerequisites:
 - A Linux system. The emulator need to be able to open a raw ethernet socket which is possible out of the box in Linux. Windows and macOS may probably require some additional changes;
-- A copy of `xonlinedash.xbe` version `185ead00 (MD5: 8149654a030d813bcc02a24f39fd3ce9)`. Some copyrighted material from the dashboard is needed for the emulator to work. Needless to say that I can't distribute it, so it will be extracted from the provided binary.
+- A copy of `xonlinedash.xbe` version `185ead00 (MD5: 8149654a030d813bcc02a24f39fd3ce9)`.
+or
+- A copy of the MN-740 firmware `NLM.MEM` `version 01.00.02.0021 (MD5: A9A58ADC4CEAEC337BAAB64F018FBA7F)` .
+ you may extract this file by:
+ # Downloading the mn740Update.exe tool.
+ # run the installer it will place the below file in the temp directory
+ # MN740_01.00.02.0021_RUNTIME.bin
+ # Extract the file with winarj or similar extraction tool and it will extract NLM.MEM file
+ 
+ note: these files are copyrighted material by Microsoft and are needed for the emulator to work. Needless to say they can't be distributed, so it will be extracted from the provided binary by the user.
 
 ### Running the emulator:
-1. First of all, you need to extract some secrets from the `xonlinedash`. You can do this by running  
-`$ python3 extract_secrets.py <path_to_xonlinedash.xbe>`
+
+1. First of all, you need to extract some secrets from either the console or the mn-740 firmware update.
+You can do this by running  
+`$ python3 extract_secrets.py <path_to_file>`
+
 
 2. Now you can run the emulator itself:  
 `$ sudo python3 emulator.py <network_interface>`  
