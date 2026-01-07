@@ -15,16 +15,14 @@ This repo currently contains the following bits:
 
 ### Prerequisites:
 - A Linux system. The emulator need to be able to open a raw ethernet socket which is possible out of the box in Linux. Windows and macOS may probably require some additional changes;
-- A copy of `xonlinedash.xbe` version `185ead00 (MD5: 8149654a030d813bcc02a24f39fd3ce9)`.
-or
-- A copy of the MN-740 firmware `NLM.MEM` `version 01.00.02.0021 (MD5: A9A58ADC4CEAEC337BAAB64F018FBA7F)` .
- you may extract this file by:
- # Downloading the mn740Update.exe tool.
- # run the installer it will place the below file in the temp directory
- # MN740_01.00.02.0021_RUNTIME.bin
- # Extract the file with winarj or similar extraction tool and it will extract NLM.MEM file
+- A copy of **one** of the following files:
+    - `xonlinedash.xbe` version `185ead00 (MD5: 8149654a030d813bcc02a24f39fd3ce9)`, **or**;
+    - The MN-740 firmware `NLM.MEM` version `01.00.02.0021 (MD5: A9A58ADC4CEAEC337BAAB64F018FBA7F)`. You can obtain this file by:
+        1. Downloading the `mn740Update.exe` tool;
+        2. Run the executable, it will place the file `MN740_01.00.02.0021_RUNTIME.bin` file into the temp directory; 
+        3. Extract the file with the WinArj or a similar extraction tool and it will extract the `NLM.MEM` file.
  
- note: these files are copyrighted material by Microsoft and are needed for the emulator to work. Needless to say they can't be distributed, so it will be extracted from the provided binary by the user.
+ Note: these files are copyrighted material by Microsoft and are needed for the emulator to work. Needless to say they can't be distributed, so it will be extracted from the binary provided  by the user.
 
 ### Running the emulator:
 
