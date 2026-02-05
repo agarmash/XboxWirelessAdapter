@@ -1,15 +1,22 @@
-# Xbox MN-740 Wireless Protocol - Complete Specification v5.1
+# Xbox MN-740 Wireless XPP over NLB (Xbox Peripheral Protocol) - Complete Specification v6.1
 
-**Status**: 99% Complete - Production Ready  
-**Last Updated**: January 2026  
-**Based on**: Firmware reverse engineering + real hardware captures
+**Status**: Near Complete
+- Development code emulating stateful adaptor responses
+- Development code configuring adaptor from configuration menu in bash.
+
+**protocol information**: Xbox Peripheral Protocol (XPP) over NLB
+The MN-740 is an Ethernet-to-Wireless bridge, but at its core, it is a managed peripheral. Unlike a standard "dumb" bridge, the Xbox console needs to control the radio (to scan for networks, set WEP keys, etc.).
+
+Microsoft used the existing Ethernet port and created a "Virtual Serial Bus" by wrapping management commands in Fake NLB Heartbeats. This allowed the Xbox to configure the adapter without needing a complex TCP/IP stack.
+
+The configuration payload structure resembles Wi-Fi Protected Setup (WPS) TLV encoding but has been modified to be lightweight.
 
 ---
 
 ## Table of Contents
 
 ### Packet Reference (Linear)
-1. [Common Packet Structure](#1-common-packet-structure)
+1. [Common Packet Structure (XPP header)](#1-common-packet-structure)
 2. [Type 0x00 - ECHO](#2-type-0x00---echo)
 3. [Type 0x01 - HANDSHAKE_REQUEST](#3-type-0x01---handshake_request)
 4. [Type 0x02 - HANDSHAKE_RESPONSE](#4-type-0x02---handshake_response)
@@ -48,17 +55,26 @@ Offset | Size | Field           | Value
 12     | 2    | EtherType       | 0x886f (NLB)
 ```
 
-### Xbox Protocol Header (12 bytes)
-```
-Offset | Size | Field              | Value
--------|------|--------------------|------------------
-0      | 4    | Magic              | "XBOX" (0x58424f58)
-4      | 2    | Checksum           | RFC 1071
-6      | 1    | Body size (DWORDs) | (total_length / 4)
-8      | 1    | Version            | 0x01
-9      | 1    | Packet Type        | 0x00-0x0e
-10     | 2    | Nonce              | Big-endian
+### Xbox Peripheral Protocol Header (XPP header) (12 bytes)
 
+```
+Offset | Size | Field              | Value / Description
+-------|------|--------------------|------------------------------------------
+0      | 4    | Magic Signature    | "XBOX" (0x58424f58)
+4      | 2    | Protocol Version   | 0x0101 (Static signature)
+6      | 1    | Body Size (DWORDs) | Total packet length / 4 (Header + Payload)
+7      | 1    | Packet Type        | Command ID (e.g., 0x01=Handshake, 0x09=Beacon)
+8      | 2    | Nonce              | Transaction ID (Matches Req/Resp)
+10     | 2    | Checksum           | RFC 1071 Header Checksum
+```
+
+**Firmware Evidence**: Handler `xbox_proto_main_dispatcher()` at line 42193 validates:
+```c
+// Nonce extraction at offset 8 (which is byte 9 after magic)
+nonce = *(uint16_t*)(packet + 8);  // Reads bytes 9-10
+
+// Packet type at offset 8 (byte 8 in packet)
+packet_type = packet[8];
 ```
 
 ### Checksum Calculation (RFC 1071)
@@ -109,6 +125,11 @@ uint16_t calculate_checksum(const uint8_t *data, size_t len) {
 
 **Static Key**: `"From isolation / Deliver me o Xbox, for I am the MN-740"`
 
+**Hmac_salt**: `"From isolation / Deliver me o Xbox - / Through the ethernet
+Copyright (c) Microsoft Corporation. All Rights Reserved."`
+
+**Auth_copyright**: `"Device is Xbox Compatible. Copyright (c) Microsoft Corporation. All Rights Reserved."`
+
 **Memory Address**: `0x800D4120` (ROM/Static Data section in firmware)
 
 **Discovery Source**: Function `xpp_calculate_hmac_sha1` at address `0x8009b274`
@@ -156,7 +177,7 @@ Simple packet reflector for latency testing and network validation.
 
 ### Packet Format
 ```
-[12 bytes] Xbox header (Type 0x00)
+[12 bytes] XPP Header (Type 0x00)
 [N bytes]  Arbitrary payload data
 ```
 
@@ -187,7 +208,7 @@ Initiates authentication session with random challenge.
 Total: 28 bytes (14 Ethernet + 12 Header + 2 Padding)
 
 [14 bytes] Ethernet header
-[12 bytes] Xbox header (Type 0x01, body size = 0x04 DWORDs)
+[12 bytes] XPP Header (Type 0x01, body size = 0x04 DWORDs)
 [16 bytes] Random challenge data
 ```
 
@@ -228,7 +249,7 @@ Authenticates adapter and provides complete wireless status (BSSID, signal, chan
 Total: 282 bytes (14 Ethernet + 12 Header + 268 Payload)
 
 [14 bytes] Ethernet header
-[12 bytes] Xbox header (Type 0x02, body size = 0x43 DWORDs)
+[12 bytes] XPP Header (Type 0x02, body size = 0x43 DWORDs)
 [268 bytes] Payload (matches 0x43 DWORDs exactly)
 ```
 
@@ -253,9 +274,7 @@ Offset (Dec) | Size | Field                   | Source Function
 219          | 1    | SSID length             | 0-32
 220          | 32   | SSID string             | FUN_800985d0()
 252          | 4    | Connection status       | Connection state
-256          | 5    | DHCP/DNS metadata       | See below
-261          | 1    | WiFi channel            | FUN_800985a0()
-262          | 20   | Reserved                | Padding
+256          | 26   | Variable Extension Tags | see Variable Extension Tags below
 ```
 
 ### Hidden Metadata Section (Bytes 186-260)
@@ -285,6 +304,40 @@ Context         |   Size   | Composition
 Standard WPA2   | 32 Bytes | Pure 256-bit Key material
 Broadcom Driver | 28 Bytes | Truncated key used for fast-path crypto
 MN-740 Packet   | 30 Bytes | 2-byte Internal State + 28-byte Key fragment
+```
+## Variable Extension Tags
+
+**⚠️ Note**: The tags listed here are part of Type 0x02's **fixed 256-byte structure**, NOT dynamic TLV tags. Do not confuse with Type 0x06's dynamic TLV system. In Type 0x02, these appear at fixed offsets within the payload.
+
+**How the Tag Construction Works**:
+In the MN-740 firmware, the tags are usually constructed in a specific order because the code follows a linear if/else or switch table (like the one you found in xpp_eth_handle_TYPE_05).
+
+However, the position (offset) of a tag is not guaranteed. If a piece of information is missing (for example, if the adapter has no IP address yet), the firmware skips that tag entirely, and the next tag in the list "slides up" to fill the empty space and builds a "packed" list of attributes.
+
+The Assembly Process
+
+State Check: The adapter checks its internal variables (stored at fixed RAM addresses like 0x800ceba0).
+Tag Generation: For every active state (e.g., "I have an IP" or "I am on Channel 11"), the adapter writes a 2-byte header:
+
+Byte 1 (Tag ID): What is this data? (e.g., 0x01 for IP).
+Byte 2 (Length): How big is the data? (e.g., 0x04 for a 4-byte IP).
+Data Insertion: The actual value is copied immediately after the header.
+
+The "Slide" Mechanic: The adapter maintains a "write pointer." After writing Tag A, it moves the pointer to the very next byte to start Tag B. If Tag A is skipped, Tag B starts where Tag A would have been.
+
+Commonly Observed Tag Order While theoretically variable, the MN-740 typically appends tags in the following sequence based on the firmware's internal loop:
+
+```
+Tag ID  | Data Size | Property      | Description
+--------|-----------|---------------|----------------
+0x01    | 4 Bytes   | IP Address    | The current local IP.
+0x02    | 1 Byte    | State         | "0=Disc, 1=Connecting, 2=Connected."
+0x04    | 1 Byte    | Op Mode       | "1=Infrastructure, 2=Ad-Hoc."
+0x06    | 1 Byte    |Signal         | Live RSSI value.
+0x07    | Variable  | SSID/Channel  | Combined wireless identity tag.
+0x0B    | 6 Bytes   | BSSID         | MAC address of the connected Access Point.
+0x0A    | Variable  | Password      | Secure network credential (if required).
+0x02    | 1 Byte    | Terminator    | "Always 02 01 00 (The ""End of Data"" marker)."
 ```
 
 #### DHCP Lease Metadata (Bytes 256-260)
@@ -351,7 +404,7 @@ Requests WiFi scan for available networks.
 Total: 60 bytes (14 Ethernet + 12 Header + 34 Padding)
 
 [14 bytes] Ethernet header
-[12 bytes] Xbox header (Type 0x03, body size = 0x03 DWORDs)
+[12 bytes] XPP Header (Type 0x03, body size = 0x03 DWORDs)
 [34 bytes] Padding (IGNORED by firmware)
 ```
 
@@ -393,7 +446,7 @@ Returns discovered networks in 59-byte slots.
 Total: Variable (14 Ethernet + 12 Header + 1 Count + N×59 Slots)
 
 [14 bytes] Ethernet header
-[12 bytes] Xbox header (Type 0x04, body size = variable)
+[12 bytes] XPP Header (Type 0x04, body size = variable)
 [1 byte]   Network count (N)
 [N×59 bytes] Network slots
 ```
@@ -425,13 +478,14 @@ Offset | Size | Field              | Description
 **Network Count**: Minimum Value
 The network count is variable but it is always more than 1.
 upon a factory reset the first slot is populated with a mshome AD-hoc network.
+upon a scan it populates it with additional networks if found.
 
 **(Packet Body)**:⚠️ Buffer Limit Warning:
 The MN-740 firmware truncates the NETWORKS_LIST_RESPONSE at 1006 bytes.
 This allows for 15 complete 59-byte slots.
 The 16th slot will be truncated after 19 bytes (BSSID + partial SSID).
 
-Developer Note: Parsers should ignore any network entry where the remaining packet length is less than 64 bytes to avoid reading partial or garbage data
+Developer Note: Parsers should ignore any network entry where the remaining packet length is less than 59 bytes to avoid reading partial or garbage data
 Why 1006 bytes?
 This specific number (1006) suggests the internal firmware is using a 1024-byte buffer for the entire Ethernet frame.
 ```
@@ -537,12 +591,12 @@ Offset | Size | Value
 
 ### Packet Format Variants
 
-#### Variant 1: Anti-Clone Challenge (triggers LONG response)
+#### Variant 1: Debug mode (triggers LONG response)
 ```
 Total: 28 bytes (14 Ethernet + 12 Header + 2 Payload)
 
 [14 bytes] Ethernet header
-[12 bytes] Xbox header (Type 0x05, body size = 0x04 DWORDs)
+[12 bytes] XPP Header (Type 0x05, body size = 0x04 DWORDs)
 [2 bytes]  Challenge nonce for HMAC
 ```
 
@@ -553,7 +607,7 @@ Total: 28 bytes (14 Ethernet + 12 Header + 2 Payload)
 Total: 26 bytes (14 Ethernet + 12 Header + 0 Payload)
 
 [14 bytes] Ethernet header
-[12 bytes] Xbox header (Type 0x05, body size = 0x03 DWORDs)
+[12 bytes] XPP Header (Type 0x05, body size = 0x03 DWORDs)
 [0 bytes]  Empty payload
 ```
 
@@ -600,25 +654,82 @@ None (payload length determines behavior)
 
 **CRITICAL**: This is what updates Xbox Dashboard signal bars! Without this response, Dashboard shows 0% signal even when connected.
 
+**⚠️ CRITICAL PARSER REQUIREMENT**: Type 0x06 responses use **DYNAMIC TLV TAG POSITIONING**. Tags are only included if they have valid data. You **MUST** parse as a TLV stream, NOT fixed offsets!
+
+**Example**: If adapter has no IP assigned, Tag 0x01 is skipped entirely, and Tag 0x02 appears at offset 0x0e instead of 0x12!
+
+**WRONG**: `signal = response[0x15];  // Fixed position - will read garbage!`  
+**RIGHT**: Parse TLV tags sequentially until finding the tag you need.
+
+**Firmware Evidence**: `xpp_eth_handle_TYPE_05_AdapterInfoReq()` at line 54615 shows conditional tag writes with `goto LAB_8009a918` skips when data unavailable.
+
 ### Packet Format
 ```
 Total: 22 bytes (14 Ethernet + 12 Header + 10 Payload)
 
 [14 bytes] Ethernet header
-[12 bytes] Xbox header (Type 0x06, body size = 0x08 DWORDs)
+[12 bytes] XPP Header (Type 0x06, body size = 0x08 DWORDs)
 [10 bytes] Status payload
 ```
 
-### Payload Structure
+### Payload Structure (Dynamic TLV Format)
+
+Type 0x06 uses **variable-length TLV encoding**. Tags appear in sequence, but only if data is available.
+
+**Common TLV Tags in Type 0x06:**
+
+| Tag  | Name              | Size | Condition         | Description |
+|------|-------------------|------|-------------------|-------------|
+| 0x01 | IP Address        | 4    | Always            | Current adapter IP (big-endian) |
+| 0x02 | Connection State  | 1    | If interface active | 0=disc, 1=connecting, 2=connected |
+| 0x04 | Op Mode           | 1    | If WiFi active    | 1=Infrastructure, 2=Ad-Hoc |
+| 0x05 | Link Quality      | 1    | If associated     | 0-100% signal quality |
+| 0x06 | BSSID             | 6    | If connected      | Connected AP MAC address |
+| 0x07 | SSID/Channel      | Var  | If associated     | Channel (1 byte) + SSID string |
+| 0x08 | OpMode Mask       | 1    | Unknown           | Operational mode bitmask (firmware: Get_Wireless_OpMode_Mask()) |
+| 0x09 | WiFi Status       | 1    | Unknown           | WiFi status flags (firmware: Get_Wifi_Status_Bitmask()) |
+| 0x0E | Antenna Status    | 1    | If radio active   | Active antenna selection (firmware: Get_Active_Antenna_Status()) |
+| 0x11 | Encryption Type   | 1    | If secured        | 0=None, 1=WEP, 2=WPA, 4=WPA2 |
+| 0x81 | Router MAC        | 6    | If gateway known  | Default gateway MAC address |
+| 0x82 | HW Revision       | 1    | Always            | Hardware revision ID |
+| 0x83 | Turbo Flag        | 1    | Always            | 802.11g Turbo mode status |
+| 0x84 | Xbox State        | 1    | Always            | Xbox pairing state |
+| 0x85 | Active Channel    | 1    | If radio on       | Current WiFi channel/rate |
+| 0x86 | Flash Block 0     | 512  | Debug mode        | Flash/EEPROM dump offset 0x000-0x1FF |
+| 0x87 | Flash Block 1     | 512  | Debug mode        | Flash/EEPROM dump offset 0x200-0x3FF |
+| 0x88 | Flash Block 2     | 512  | Debug mode        | Flash/EEPROM dump offset 0x400-0x5FF |
+| 0x89 | Flash Block 3     | 512  | Debug mode        | Flash/EEPROM dump offset 0x600-0x7FF |
+| 0x8A | Flash Block 4     | 512  | Debug mode        | Flash/EEPROM dump offset 0x800-0x9FF |
+
+**Parser Example:**
+```c
+// CORRECT - TLV parsing:
+uint8_t pos = 0;
+while (pos < response_length) {
+    uint8_t tag = response[pos];
+    uint8_t len = response[pos + 1];
+    uint8_t *data = &response[pos + 2];
+
+    switch (tag) {
+        case 0x05:  // Link quality
+            signal_quality = data[0];
+            break;
+        case 0x06:  // BSSID
+            memcpy(bssid, data, 6);
+            break;
+        case 0x07:  // SSID/Channel
+            channel = data[0];  // First byte is channel
+            memcpy(ssid, &data[1], len - 1);  // Rest is SSID
+            break;
+        // ... handle other tags ...
+    }
+
+    pos += 2 + len;  // Advance to next tag
+}
 ```
-Offset | Size | Field              | Firmware Function       | Values
--------|------|--------------------|-----------------------|------------------
-0      | 1    | Connection status  | is_wireless_associated (0x80098790) | 0x00=scanning, 0x01=connected
-1      | 1    | Signal strength    | wlan_signal_quality_monitor (0x8000cf78) | 0-100%
-2      | 1    | Link quality       | get_wireless_link_quality (0x8009913c) | 0-100%
-3      | 1    | WiFi channel       | get_wireless_channel (0x800985a0) | 1-14
-4-9    | 6    | BSSID              | get_wireless_bssid (0x80076d50) | Current AP MAC
-```
+
+**Firmware Source**: `xpp_eth_handle_TYPE_05_AdapterInfoReq()` lines 54672-54829
+
 
 ### Signal Scaling (SHORT Format)
 
@@ -632,10 +743,104 @@ uint8_t get_signal_for_dashboard(int8_t rssi_dbm) {
     if (percent > 100) return 100;
     return (uint8_t)percent;
 }
+
+
+### Tag 0x05 - Link Quality
+
+**✅ Confirmed by Real Hardware**: Tag 0x05 appears in all Type 0x06 responses from real MN-740 hardware.
+
+**Firmware Source** (line 42580-42585):
+```c
+case 5:  // Tag 0x05
+    local_res4 = 1;
+    memcpy(pvVar5, &local_res4, 1);              // Length = 1
+    local_res5 = wlan_get_signal_strength();     // Get link quality
+    memcpy((void *)((int)dest + 2), &local_res5, 1);
 ```
+
+**Format**:
+- Tag: 0x05
+- Length: 0x01 (1 byte)
+- Value: 0x00-0x64 (0-100 decimal percentage)
+
+**Real Hardware Example**:
+```
+05 01 4B     ← Tag 0x05, Length 1, Value 0x4B (75%)
+```
+
+**Purpose**: Reports wireless link quality as percentage. This is distinct from Type 0x02's signal strength (0-255 scale).
+
+**Analysis**: The firmware calls `wlan_get_signal_strength()` which:
+1. Polls the radio's RSSI statistics via `hw_get_rssi_stats()`
+2. Normalizes to 0-100% range
+3. Returns single-byte percentage value
+
+**Note**: While Tag 0x05 handler wasn't in the initially analyzed firmware section, real packet captures prove it exists and is populated by the adapter.
+
 
 ### Update Frequency
 Xbox sends Type 0x05 status queries approximately **every 2-3 seconds** during normal operation.
+
+### Tag 0x07 Special Encoding ✅ FIRMWARE VERIFIED
+
+**Firmware uses channel count AS the TLV length byte!**
+
+```c
+local_res4 = get_wireless_channel();           // Returns channel number (1-14)
+memcpy(pvVar5, &local_res4, 1);                // Use channel AS length!
+memcpy((void *)((int)dest + 2), &ssid, (uint)local_res4); // Copy SSID
+```
+
+**Example** (Channel 6, SSID "hidden"):
+```
+07 06 68 69 64 64 65 6e
+│  │  └──────────────────┘
+│  │         └─ "hidden" (6 bytes)
+│  └─ Length: 6 (this IS the channel!)
+└─ Tag: 0x07
+```
+
+**Constraint**: This works because WiFi channels (1-14) safely encode SSIDs up to 14 bytes. Longer SSIDs (15-32 bytes) would fail on low channels!
+
+It is unknown why this is done as it could be just 1-2 bytes lenght and show the actual channel in the  body.
+this may need further investigation?
+
+### Flash Dump Feature (Tags 0x86-0x8A) ✅ NEW DISCOVERY
+
+**Purpose**: Allow Xbox Dashboard to verify adapter firmware authenticity and extract configuration data.
+
+**Memory Layout**:
+```
+Tag 0x86: Flash offset 0x000-0x1FF (512 bytes)
+Tag 0x87: Flash offset 0x200-0x3FF (512 bytes)
+Tag 0x88: Flash offset 0x400-0x5FF (512 bytes)
+Tag 0x89: Flash offset 0x600-0x7FF (512 bytes)
+Tag 0x8A: Flash offset 0x800-0x9FF (512 bytes)
+Total: 2560 bytes (0xA00)
+```
+
+**Base Address**: `&DAT_8024abc8` (firmware memory)
+
+**Firmware Implementation** (lines 54818-54829):
+```c
+if (4 < uVar4 - 0x85) goto LAB_8009a918;
+uVar4 = (uint)local_res3;
+iVar11 = error_helper_30(&DAT_8024abc8, 0, 0x400);
+if (iVar11 == 0) {
+    memset(&DAT_8024abc8, 0xff, 0x800);
+}
+local_res4 = 0xff;
+memcpy(pvVar5, &local_res4, 1);                    // Length = 0xFF (512 bytes)
+memcpy((void *)((int)dest + 2),
+       &DAT_8024abc8 + (uVar4 - 0x86) * 0x200,     // Offset calculation
+       0x200);                                      // Copy 512 bytes
+pvVar5 = (void *)((int)dest + 0x202);
+uVar6 = uVar7 + 0x202;
+```
+
+**Security Note**: This feature allows remote firmware verification but could also be exploited for firmware extraction. Each 512-byte block requires a separate Type 0x05 request with the corresponding tag (0x86-0x8A).
+
+**Usage**: Xbox Dashboard can in theory request these tags to verify the adapter is genuine Microsoft hardware by checking firmware signatures and version strings stored in flash.
 
 ### Tags
 None (fixed 10-byte structure)
@@ -654,24 +859,24 @@ None (fixed 10-byte structure)
 **HMAC Required**: Yes (bytes 6-25)
 
 ### Brief Description
-**LONG FORMAT** - Anti-clone certificate verification.
+**LONG FORMAT** - authentication gate for enhanced features.
 
 **Triggered by**: Type 0x05 with **2-byte challenge nonce**
 
-**Purpose**: Proves adapter is genuine MN-740 hardware. Used during:
-- Initial pairing
-- Dashboard entry
-- Xbox Live connection
+**Purpose**: switches adapter State into debug/ TFTP upgrade mode.
+- extended debug strings -x80-0xFF
+- TFTP upgrade server
+
 
 ### Packet Format
 ```
 Total: 52 bytes (14 Ethernet + 12 Header + 26 Payload + 20 Anti-Tamper Padding)
 
 [14 bytes] Ethernet header
-[12 bytes] Xbox header (Type 0x06, body size = 0x0d DWORDs)
+[12 bytes] XPP Header (Type 0x06, body size = 0x0d DWORDs)
 [6 bytes]  Metadata
 [20 bytes] HMAC-SHA1 signature
-[20 bytes] Anti-tamper padding (zeros)
+[20 bytes] Anti-tamper padding (XPP_Integrity_Sentinel) (zeros)
 ```
 
 ⚠️ **CRITICAL CORRECTION**: The firmware at `0x8009F8C0` appends 20 bytes of anti-tamper padding (usually zeros) to ensure the packet meets minimum Ethernet frame size requirements. The wire format is **52 bytes total**, not 32 bytes.
@@ -715,6 +920,61 @@ void make_anticlone_hmac(uint16_t challenge_nonce, uint8_t *signature_out) {
 
 ✅ **Valid HMAC** → Xbox accepts adapter as genuine
 
+## Debug log
+
+The Driver-Level Backdoor
+The XPP implementation on the MN-740 includes a direct hook into the network driver's vtable.
+
+Mechanism: When Attribute 0x86 is requested in debug mode, the code calls driver_vtable_read_stats_word.
+This bypasses the Xbox OS and the Bridge OS entirely, pulling data directly from the WiFi chip's internal registers.
+
+This log is 512 bytes. It is a full register dump of the wireless radio's state (MAC state, PHY errors, and signal retry counts).
+
+###The Request Structure
+To trigger the "Long Response" (the driver dump), your XPP frame needs to look like this:
+
+1. The XPP Header (12 Bytes)
+```
+ Field       |             
+-------------|-------------
+Magic:       | XBOX        
+Version:     | 0x0101
+Body Size:   | 0x04 (Requesting 1 attribute usually fits in a small frame)
+Packet Type: | 0x05 (Adapter Info Request)
+Nonce:       | Any 2-byte value (e.g., 0x1234)
+Checksum:    | Calculated for the frame.
+```
+
+2. The Payload (Requesting the Attribute)
+The payload for a Type 05 request consists of a "Count" byte followed by the list of IDs.
+
+Offset 12 (Payload Start): 0x01 (This tells the adapter: "I am requesting 1 attribute")
+
+Offset 13: 0x86 (This is the specific Attribute ID for the debug log)
+
+## TFTP Firmware Upgrade
+
+**Transport**: UDP port 69 (standard TFTP)  
+**Authentication**: Type 0x06 LONG response required first  
+**State Requirement**: State 7 (authenticated adapter)
+
+### Upgrade Sequence
+
+1. Send Type 0x05 with 2-byte challenge nonce
+2. Receive Type 0x06 LONG with valid HMAC-SHA1
+3. Adapter transitions to State 7
+4. TFTP server accepts connections
+5. Upload firmware via standard TFTP WRQ
+6. Adapter validates and flashes firmware
+7. Automatic reboot with new firmware
+
+### TFTP Protocol Details
+
+- **Block Size**: 512 bytes (RFC 1350 standard)
+- **Retries**: Adaptive timeout with retry limit
+- **Validation**: Checksum verification before flash
+- **Flash Address**: 0xBFC00000 (MIPS boot flash)
+
 ### Tags
 None (fixed structure)
 
@@ -738,7 +998,7 @@ Configures network connection with TLV-encoded parameters.
 Total: Variable (14 Ethernet + 12 Header + TLV Payload + 20 HMAC)
 
 [14 bytes] Ethernet header
-[12 bytes] Xbox header (Type 0x07, body size = variable)
+[12 bytes] XPP Header (Type 0x07, body size = variable)
 [N bytes]  TLV configuration tags
 [20 bytes] HMAC-SHA1 signature
 ```
@@ -757,24 +1017,31 @@ N-20   | 20       | HMAC signature
 |------|-------------------|-----------|----------|-------------|
 | 0x01 | SSID              | 1-32      | Yes      | Network name (ASCII) |
 | 0x02 | Password          | 0-63      | If secured | WPA/WPA2 passphrase |
-| 0x03 | Preamble Type     | 1         | Optional | 0x00 = Short Preamble, 0x01 = Long Preamble. |
-| 0x04 | SSID (alt)        | 1-32      | Yes      | Alternate SSID field (must match 0x01) |
-| 0x05 | Security Type     | 1         | Yes      | Security configuration 1=open 2=WEP 4=WPA(TKIP) 8=WPA2(AES/CCMP) |
-| 0x06 | IP Address        | 4         | Optional | Static IP (big-endian) |
-| 0x07 | Subnet Mask       | 4         | Optional | Network mask |
-| 0x08 | Gateway           | 4         | Optional | Default gateway |
-| 0x09 | Network Mode      | 1         | Yes      | 0x04 = Infrastructure |
+| 0x03 | SSID/Identity     | 0-11      | Optional | Factory default: "admin", overwritten by Xbox with SSID on connection |
+| 0x04 | Operating Mode    | 1         | Optional | Wireless operating mode configuration (firmware: WLAN_Set_Operating_Mode()) |
+| 0x05 | WiFi State Flag   | 1         | Optional | WiFi radio state control (firmware: set_wifi_state_flag())|
+| 0x06 | Target Xbox MAC   | 6         | Optional | 6-byte MAC address of paired Xbox console (firmware: set_target_xbox_mac()) |
+| 0x07 | SSID              | Variable  | Yes      | Network SSID to connect (firmware: set_connection_SSID()) |
+| 0x08 | Network Mode      | 1         | Optional | Network topology mode (firmware: set_wifi_network_mode()) |
+| 0x09 | Association State | 1         | Optional | Wireless association state (firmware: WLAN_Update_Association_State()) |
 | 0x0A | WPA Key           | Variable  | If secured | Raw 256-bit Pre-Shared Key |
 | 0x0E | **Region Code**   | 1         | **CRITICAL** | See Region Codes below |
 | 0x0F | WEP-128 Password  | 13        | If WEP-128 | 13 ASCII characters |
 | 0x10 | **WPA Stub**      | 2+32      | **PARSER TRAP** | Must skip exactly 34 bytes! (Pairwise Master Key) |
-| 0x11 | Commit Flag       | 1         | Optional | Save to flash |
 | 0x12 | Region (alt)      | 1         | Optional | Alternate region tag |
 | 0x14 | Clone MAC Address | 6         | Optional | MAC spoofing (see below) |
+| 0x11 | Flash Save Flag   | 1         | Optional | Commit current configuration to flash memory (firmware: flash_commit_and_save()) |
+| 0x83 | Turbo Mode Flag   | 1         | Optional | 802.11g Turbo mode. Valid values: 0, 1, 2 (defaults to 1 if invalid) |
+| 0x84 | Connection Rate   | 1         | Optional | Connection rate parameter, validated against hardware capabilities (default 0x0B) |
+| 0x85 | Rate Selection    | 1         | Optional | 802.11 data rate (see Tag 0x85 whitelist below) - values NOT in whitelist are ignored |
 
 **Note**: Internal evidence suggests tag 0x13 was designated for (Turbo G) but this feature is DELETED / NOP
 
 ⚠️ **CRITICAL**: Tags 0x01 and 0x04 (SSID) must match exactly - this field is used as verification of the SSID.
+
+## Tag 0x03 - SSID/ Identity
+This tag / structure was reused my Microsoft from the base adaptors firmware and is actually the username of the HTTP web Admin Username/Identity.
+upon connection is  overwritten by Xbox with SSID.
 
 ### Tag 0x14 - MAC Address Cloning ⚠️
 
@@ -791,6 +1058,24 @@ N-20   | 20       | HMAC signature
 Confirmed in hardware captures where the console successfully spoofed the MAC.
 
 Constraint: As this modifies the hardware's Layer 2 identity, it must be processed before the 802.11 association state machine moves to "Connected."
+
+### Tag 0x03 - Admin Username / Identity SSID ✅ FIRMWARE DISCOVERY
+
+**Factory Default Behavior**: On boot or factory reset, firmware initializes this field to "admin" via:
+```c
+util_strcpy(&CFG_Admin_Username, s_admin_800bc704);  // "admin" from 0x800bc704
+```
+
+**Runtime Behavior**: When Xbox Dashboard connects, Tag 0x03 is **overwritten with the network SSID**. This repurposes the generic "Admin Username" field (from router firmware heritage) as the adapter's network identity.
+
+**Memory Addresses**:
+- `0x800cebac`: CFG_Admin_Username (becomes SSID after connection)
+- `0x800cebc0`: CFG_Admin_Password (typically remains "admin")
+- `0x800bc704`: Hardcoded string constant "admin" in ROM
+
+**Why This Matters**: Early packet captures showing "admin" are seeing the factory default state before Xbox overwrites it with the actual SSID during connection setup.
+
+**Firmware Evidence**: Line 54908-54912 shows `memcpy(&CFG_Admin_Username, src, n)` handler for Tag 0x03.
 
 ### ⚠️ CRITICAL: Tag 0x10 WPA Stub (Parser Trap)
 
@@ -824,6 +1109,38 @@ switch (tag) {
 
 **Failure mode**: Processing Tag 0x10 data will corrupt all subsequent tags.
 
+### Tag 0x85 - Rate Selection Whitelist ✅ FIRMWARE VERIFIED
+
+**Firmware validation**: Lines 55018-55027  
+**Behavior**: Values NOT in this whitelist are **silently ignored**
+
+| Hex  | Decimal | Rate (Mbps) | Standard  | Notes |
+|------|---------|-------------|-----------|-------|
+| 0x00 | 0       | Auto-select | -         | Automatic rate negotiation |
+| 0x02 | 2       | 1 Mbps      | 802.11b   | Legacy compatibility |
+| 0x04 | 4       | 2 Mbps      | 802.11b   | Legacy compatibility |
+| 0x0B | 11      | 5.5 Mbps    | 802.11b   | - |
+| 0x0C | 12      | 6 Mbps      | 802.11g   | Basic rate |
+| 0x12 | 18      | 9 Mbps      | 802.11g   | - |
+| 0x16 | 22      | 11 Mbps     | 802.11b   | Maximum 802.11b rate |
+| 0x18 | 24      | 12 Mbps     | 802.11g   | - |
+| 0x24 | 36      | 18 Mbps     | 802.11g   | - |
+| 0x30 | 48      | 24 Mbps     | 802.11g   | - |
+| 0x48 | 72      | 36 Mbps     | 802.11g   | - |
+| 0x60 | 96      | 48 Mbps     | 802.11g   | - |
+| 0x6C | 108     | 54 Mbps     | 802.11g   | Maximum 802.11g rate |
+
+**Firmware Code**:
+```c
+if (((((local_res5 == 0) || (local_res5 == 2)) ||
+     ((local_res5 == 4 || ((((local_res5 == 0xb || (local_res5 == 0xc)) ||
+     (local_res5 == 0x12)) || ((local_res5 == 0x16 || (local_res5 == 0x18)))))))) ||
+     (local_res5 == 0x24)) || (((local_res5 == 0x30 || (local_res5 == 0x48)) ||
+     ((local_res5 == 0x60 || (local_res5 == 0x6c)))))) {
+    G_XPP_ActiveChannel = local_res5;
+}
+```
+
 ### Region Code (Tag 0x0E) - CRITICAL
 
 **Memory Address**: `0x800A984E` (Stored in EEPROM/Flash)
@@ -847,7 +1164,7 @@ switch (tag) {
 | 0x01 | SSID              | 1-32      | Yes      | Ad-hoc network name |
 | 0x03 | Wireless Mode     | 1         | Optional | 0=B/G, 1=B only, 2=G only |
 | 0x02 | **WiFi Channel**  | 1         | **Yes**  | Channel 1-14 (MANDATORY) |
-| 0x08 | Capability Marker | 1         | Optional | bitwise 0=std beacon, 1=privacy bit, 2=short slot (turbo G) 4=short preamble allowed |
+| 0x08 | Network Mode      | 1         | Optional | Network topology mode (firmware: set_wifi_network_mode()) |
 | 0x09 | Network Mode      | 1         | Yes      | 0x01=Ad-hoc open, 0x02=Ad-hoc encrypted |
 | 0x0A | WEP Key Slot 1    | 5         | If WEP   | First WEP-64 key |
 | 0x0B | WEP Key Slot 2    | 5         | If WEP   | Second WEP-64 key |
@@ -895,9 +1212,9 @@ All TLV tags use: `[1 byte Tag][1 byte Length][N bytes Value]`
 
 ### WPA/WPA2 Hardware Support Note
 
-**Theory vs Practice**: The MN-740's encryption engine is fully capable of WPA2 (AES-CCMP) in hardware.
+**Theory vs Practice**: The MN-740's encryption engine is fully capable of WPA (TKIP) and  WPA2 (AES-CCMP) in hardware.
 
-The reason the official software doesn't support it isn't a hardware limitation; it is a firmware and driver limitation. The MN-740 is built on the Marvell Libertas 88W8310 chipset.
+The reason the official software doesn't support WPA2 it isn't a hardware limitation; it is a firmware and driver limitation. The MN-740 is built on the Marvell Libertas 88W8310 chipset.
 
 **Hardware Proof**:
 
@@ -910,7 +1227,9 @@ The "Security Engine" inside the Marvell chip is a dedicated hardware block loca
 
 - The Engine is there: The AES hardware sits at `0x4000D000`
 - The Driver is missing: The firmware functions are written to only handle 40-bit/104-bit WEP key exchange
-- The Handshake Problem: WPA2 requires a complex "4-Way Handshake" to generate temporary keys (PTK/GTK). The original MN-740 firmware simply doesn't contain the code to perform this handshake
+- The Handshake Problem: WPA2 requires a complex "4-Way Handshake" to generate temporary keys (PTK/GTK). The original MN-740 firmware simply doesn't contain the code to perform this handshake.
+
+The MN-740 looks like it was designed with WPA2 support in mind but with one caveat the Xbox was designed to create the temporary 4-way key and send it to the adaptor to connect to the network.
 
 **WPA (TKIP) Support**:
 
@@ -924,7 +1243,8 @@ The Marvell chip has a specific hardware block for TKIP (Temporal Key Integrity 
 
 Even though the hardware engine at `0x4000D020` is ready, the Official Firmware lacks the "WPA Supplicant" (the software handshake). The firmware sees the "WPA" beacon, realizes it doesn't have the software to talk to it, and often defaults back to searching or throws an error code.
 
-**Important Note**: The dashboard was not extended to do WPA or WPA2 when in reality the adapter is capable of it.
+**Important Note**: The xbox dashboard was not extended to do WPA or WPA2 when in reality the adapter is capable of it.
+The MN-740 looks like it was designed with WPA2 support in mind but with one caveat the Xbox was designed to negotiate the temporary 4-way handshake key and send it to the adaptor to connect to the network.
 
 ### Related Information
 - [Type 0x08 Response](#10-type-0x08---connect_to_ssid_response)
@@ -946,7 +1266,7 @@ Confirms connection request result.
 Total: 33 bytes (14 Ethernet + 12 Header + 1 Result + 20 HMAC)
 
 [14 bytes] Ethernet header
-[12 bytes] Xbox header (Type 0x08, body size = 0x0d DWORDs)
+[12 bytes] XPP Header (Type 0x08, body size = 0x0d DWORDs)
 [1 byte]   Result code
 [19 bytes] Reserved/padding
 [20 bytes] HMAC-SHA1 signature
@@ -995,7 +1315,7 @@ Network reachability validation (Ping/ARP check) after connection.
 ```
 Total: Variable (UDP payload only)
 
-[12 bytes] Xbox header (Type 0x08)
+[12 bytes] XPP Header (Type 0x08)
 [N bytes]  Ping/ARP payload
 ```
 
@@ -1033,7 +1353,7 @@ Keepalive heartbeat sent every 1 second.
 Total: 36 bytes (14 Ethernet + 12 Header + 4 Data + 20 HMAC)
 
 [14 bytes] Ethernet header
-[12 bytes] Xbox header (Type 0x09, body size = 0x09 DWORDs)
+[12 bytes] XPP Header (Type 0x09, body size = 0x09 DWORDs)
 [4 bytes]  Usually 0x00 0x00 0x00 0x00
 [20 bytes] HMAC-SHA1 signature
 ```
@@ -1087,7 +1407,7 @@ None (fixed structure)
 
 ## 12. Type 0x0a - BEACON_RESPONSE
 
-**Direction**: Adapter → Xbox  
+**Direction**: Adapter â†’ Xbox  
 **Transport**: Ethernet 0x886f  
 **HMAC Required**: No
 
@@ -1099,7 +1419,7 @@ Real-time security and connection status.
 Total: 16 bytes (14 Ethernet + 12 Header + 4 Payload)
 
 [14 bytes] Ethernet header
-[12 bytes] Xbox header (Type 0x0a, body size = 0x04 DWORDs)
+[12 bytes] XPP Header (Type 0x0a, body size = 0x04 DWORDs)
 [4 bytes]  Security status
 ```
 
@@ -1166,7 +1486,7 @@ Broadcast discovery to find all adapters on network.
 ```
 Total: 12 bytes (UDP payload only)
 
-[12 bytes] Xbox header (Type 0x0d, body size = 0x03 DWORDs)
+[12 bytes] XPP Header (Type 0x0d, body size = 0x03 DWORDs)
 [0 bytes]  No payload
 ```
 
@@ -1201,7 +1521,7 @@ Provides adapter identity for pairing.
 ```
 Total: 40 bytes (UDP payload only)
 
-[12 bytes] Xbox header (Type 0x0e, body size = 0x0a DWORDs)
+[12 bytes] XPP Header (Type 0x0e, body size = 0x0a DWORDs)
 [28 bytes] Adapter identity
 ```
 
@@ -1255,7 +1575,7 @@ void *udp_discovery_thread(void *arg) {
         ssize_t len = recvfrom(udp_socket, buffer, sizeof(buffer), 0,
                               (struct sockaddr *)&client_addr, &client_len);
 
-        if (len < 12) continue;  // Too small for Xbox header
+        if (len < 12) continue;  // Too small for XPP Header
 
         // Verify Xbox protocol header
         if (memcmp(buffer, "XBOX", 4) != 0) continue;
@@ -1498,7 +1818,7 @@ class UDPDiscovery:
    - Tag 0x0A-0x0E: WEP keys and index (if encrypted)
    - HMAC signature
 
-6. Adapter → Xbox:  CONNECT_TO_SSID_RESPONSE (Type 0x08)
+6. Adapter â†’ Xbox:  CONNECT_TO_SSID_RESPONSE (Type 0x08)
    - Result code 0x00
    ✅ Ad-hoc network created
 
@@ -1710,6 +2030,89 @@ These firmware functions populate fields in Type 0x02 handshake response:
 
 ---
 
+
+---
+
+## TLV Tag Master List ✅ COMPLETE FIRMWARE EXTRACTION
+
+**Source**: `xpp_parse_config_tlv()` at line 42707 and `xpp_eth_handle_TYPE_05_AdapterInfoReq()` at line 42481
+
+### Type 0x07 Configuration Tags (Complete)
+
+**Handler Function**: `xpp_parse_config_tlv()` at line 54842  
+**Direction**: Xbox → Adapter
+
+| Tag | Name | Size | Handler Function (Line) | Description |
+|-----|------|------|------------------------|-------------|
+| 0x00 | Flash Commit & Reboot | 0 | Flash_Commit_Settings() (54894-54897) | Commits settings to flash and triggers system reboot |
+| 0x01 | IP Address | 4 | memcpy(&CFG_Device_IP) (54901-54903) | Static IP address configuration (big-endian) |
+| 0x02 | Connection State | 1 | G_NET_InterfaceStatus (54905-54907) | Connection mode: 0x02=force connect, else disconnect |
+| 0x03 | Admin Username | Variable | memcpy(&CFG_Admin_Username) (54908-54912) | Administrator username (max 0x11 bytes) - factory default "admin" |
+| 0x04 | Operating Mode | 1 | WLAN_Set_Operating_Mode() (54913-54916) | Wireless operating mode configuration |
+| 0x05 | WiFi State Flag | 1 | set_wifi_state_flag() (54918-54922) | WiFi radio state control - **NOT security type!** |
+| 0x06 | Target Xbox MAC | 6 | set_target_xbox_mac() (54923-54926) | 6-byte MAC address of paired Xbox console |
+| 0x07 | SSID | Variable | set_connection_SSID() (54927-54930) | Network SSID or identity string |
+| 0x08 | Network Mode | 1 | set_wifi_network_mode() (54931-54935) | Network topology mode |
+| 0x09 | Association State | 1 | WLAN_Update_Association_State() (54936-54940) | Wireless association state update |
+| 0x0A | Security Key Slot 0 | 5 | Wifi_Set_Security_Key(src, 0) (54941-54944) | WEP key slot 0 or WPA passphrase |
+| 0x0B | Security Key Slot 1 | 5 | Wifi_Set_Security_Key(src, 1) (54945-54948) | WEP key slot 1 |
+| 0x0C | Security Key Slot 2 | 5 | Wifi_Set_Security_Key(src, 2) (54949-54952) | WEP key slot 2 |
+| 0x0D | Security Key Slot 3 | 5 | Wifi_Set_Security_Key(src, 3) (54953-54956) | WEP key slot 3 |
+| 0x0E | Region/Key Index | 1 | set_radio_channel_index() (54957-54961) | Regulatory region or active WEP key index |
+| 0x0F | WEP-128 Advanced | 13 | Wifi_Set_Advanced_Params() (54962-54968) | 13-byte WEP-128 key, calls handler 4 times |
+| 0x10 | WPA Stub ⚠️ | 34 | SKIP (54969-54971) | **Parser trap** - advances 34 bytes without processing |
+| 0x11 | Flash Save Flag | 1 | flash_commit_and_save() (54974-54977) | Save current config to flash memory |
+| 0x14/0x81 | MAC Address Clone | 6 | Net_Set_MAC_Address() (54979-54983) | Network MAC address spoofing for ISP bypass |
+| 0x82 | Interface Config | 1 | update_interface_config() + hw_get_revision_id() (54991-54996) | Interface configuration update with hardware revision |
+| 0x83 | Turbo Mode Flag | 1 | G_XPP_TurboFlag (54998-55004) | **Valid values**: 0, 1, 2 (defaults to 1 if invalid) |
+| 0x84 | Connection Rate | 1 | g_Xbox_Connection_State (55006-55013) | Value validated against min/max range (default 0x0B) |
+| 0x85 | Rate Selection | 1 | G_XPP_ActiveChannel (55016-55027) | 802.11 rate parameter (see whitelist) |
+
+
+### Type 0x06 Query Tags (Complete)
+
+| Tag | Name | Size | Source Function (Line) | Description |
+|-----|------|------|----------------------|-------------|
+| 0x01 | IP Address | 4 | &CFG_Device_IP (42567-42572) | Current adapter IP address |
+| 0x02 | Connection State | 1 | cRam800ceba0 / iRam800fcf44 (42549-42565) | 0=disconnected, 1=connecting, 2=connected |
+| 0x04 | Op Mode | 1 | wlan_get_op_mode_flag() (42541-42547) | 1=Infrastructure, 2=Ad-Hoc |
+| 0x05 | Link Quality | 1 | wlan_get_signal_strength() (42580-42585) | 0-100% signal quality |
+| 0x06 | BSSID | 6 | wlan_get_current_bssid() (42588-42594) | Connected AP MAC address |
+| 0x07 | SSID/Channel | Variable | get_wireless_channel() + hw_get_ssid_string() (42596-42604) | Channel (1 byte) + SSID string |
+| 0x08 | Unknown Status | 1 | FUN_80098bc4() (42606-42612) | Unknown status flag |
+| 0x09 | Unknown Status | 1 | FUN_80098c7c() (42615-42621) | Unknown status flag |
+| 0x0B | BSSID | 6 | wlan_get_current_bssid() (42588-42594) | Same as 0x06 |
+| 0x0E | Unknown Status | 1 | FUN_80098694() (42625-42631) | Unknown status flag |
+| 0x11 | Encryption Type | 1 | wlan_get_encryption_type() (42633-42639) | 0=None, 1=WEP, 2=WPA, 4=WPA2 |
+| 0x81 | Router MAC | 6 | &g_ROUTER_MAC_ADDRESS (42641-42646) | Gateway/router MAC address |
+| 0x82 | HW Revision | 1 | hw_get_revision_id() (42649-42656) | Hardware revision ID |
+| 0x83 | Unknown Flag | 1 | uRam800ceb00 (42659-42665) | Internal firmware state flag |
+| 0x84 | Unknown Flag | 1 | uRam800cea05 (42667-42673) | Internal diagnostic flag |
+| 0x85 | Unknown Flag | 1 | uRam800cea06 (42675-42681) | Internal diagnostic flag |
+| 0x86-0x8A | Bulk Flash Data | 512 | Flash read at offset (42684-42694) | 512-byte flash/EEPROM dump blocks |
+
+### Tag 0x85 Valid Values (Complete Whitelist)
+
+**Firmware validation**: Lines 42882-42891
+
+| Hex | Decimal | Rate (Mbps) | Standard |
+|-----|---------|-------------|----------|
+| 0x00 | 0 | Auto-select | - |
+| 0x02 | 2 | 1 Mbps | 802.11b |
+| 0x04 | 4 | 2 Mbps | 802.11b |
+| 0x0B | 11 | 5.5 Mbps | 802.11b |
+| 0x0C | 12 | 6 Mbps | 802.11g |
+| 0x12 | 18 | 9 Mbps | 802.11g |
+| 0x16 | 22 | 11 Mbps | 802.11b |
+| 0x18 | 24 | 12 Mbps | 802.11g |
+| 0x24 | 36 | 18 Mbps | 802.11g |
+| 0x30 | 48 | 24 Mbps | 802.11g |
+| 0x48 | 72 | 36 Mbps | 802.11g |
+| 0x60 | 96 | 48 Mbps | 802.11g |
+| 0x6C | 108 | 54 Mbps | 802.11g |
+
+**Note**: Values NOT in this whitelist are silently ignored by firmware.
+
 ## Implementation Checklist
 
 ### Phase 1: Core Infrastructure ✅
@@ -1718,7 +2121,7 @@ These firmware functions populate fields in Type 0x02 handshake response:
 - [ ] UDP socket listener (port 2002)
 - [ ] RFC 1071 checksum implementation
 - [ ] HMAC-SHA1 authentication
-- [ ] Packet parser for Xbox headers
+- [ ] Packet parser for XPP Headers
 - [ ] Load secrets (hmac_key.bin, hmac_salt.bin, auth_copyright.bin)
 
 ### Phase 2: Discovery & Authentication ✅
@@ -1735,7 +2138,7 @@ These firmware functions populate fields in Type 0x02 handshake response:
 - [ ] WiFi scan integration (iw/nmcli/wpa_cli)
 - [ ] Type 0x04 networks list response builder
 - [ ] 59-byte network slot encoding
-- [ ] Signal strength conversion (dBm → 0-255)
+- [ ] Signal strength conversion (dBm â†’ 0-255)
 
 ### Phase 4: Connection Management ✅
 
@@ -1773,6 +2176,65 @@ These firmware functions populate fields in Type 0x02 handshake response:
 
 ## Troubleshooting Guide
 
+
+
+### Tag 0x05 Missing from Response
+
+**Symptom**: Dashboard shows 0% signal even when connected
+
+**Cause**: Tag 0x05 (Link Quality) not included in Type 0x06 response
+
+**Solution**:
+```c
+// Tag 0x05 handler for Type 0x06 response
+case 5:
+    response[pos++] = 0x05;                    // Tag ID
+    response[pos++] = 0x01;                    // Length
+    response[pos++] = get_link_quality_percent(); // 0-100
+    break;
+```
+
+**Verification**: Check real hardware captures - Tag 0x05 ALWAYS appears with value 0x00-0x64.
+
+### Tag 0x10 Parser Corruption
+
+**Symptom**: All tags after Tag 0x10 are misaligned/corrupt
+
+**Cause**: Processing Tag 0x10 data instead of skipping it
+
+**Solution**:
+```c
+case 0x10:
+    pos += 34;  // Skip 2-byte header + 32-byte PMK
+    break;      // Do NOT process the data
+```
+
+**Debug**:
+```c
+printf("Before Tag 0x10: pos=%d\n", pos);
+pos += 34;
+printf("After Tag 0x10: pos=%d (should be +34)\n", pos);
+```
+
+### Tag 0x07 SSID vs Subnet Mask Confusion
+
+**Symptom**: Network connection fails with "invalid subnet mask" error
+
+**Cause**: Protocol manual v5.0 incorrectly documented Tag 0x07 as subnet mask
+
+**Solution**: Tag 0x07 is **SSID**, confirmed by:
+- Firmware function `func_0x800985e4()` at line 42793
+- Real hardware packets showing "visable" network name
+- TLV TAG MASTER LIST verification
+
+**Correct Usage**:
+```c
+// Tag 0x07 = SSID (NOT subnet mask!)
+tag_0x07[0] = 0x07;
+tag_0x07[1] = ssid_len;
+memcpy(&tag_0x07[2], ssid_string, ssid_len);
+```
+
 ### Common Issues and Solutions
 
 #### Dashboard shows 0% signal even when connected
@@ -1790,27 +2252,6 @@ These firmware functions populate fields in Type 0x02 handshake response:
 printf("Type 0x06: status=%02x signal=%d%% channel=%d\n",
        response[0], response[1], response[3]);
 // Should show: status=01 signal=75% channel=6
-```
-
-#### Xbox shows "Adapter not supported"
-
-**Cause**: Invalid HMAC signature in Type 0x06 LONG response
-
-**Solution**:
-- Verify you're using the correct HMAC key: "From isolation / Deliver me o Xbox, for I am the MN-740"
-- Ensure challenge nonce from Type 0x05 request is echoed correctly
-- Check HMAC is computed over the header (12 bytes) before padding
-- Verify anti-tamper padding (20 bytes of zeros) is appended
-
-**Debug**:
-```c
-// Verify HMAC input
-uint8_t header[12] = "XBOX\x01\x01\x0d\x06";
-*(uint16_t*)(header + 8) = challenge_nonce;  // Big-endian!
-*(uint16_t*)(header + 10) = 0;  // Checksum zero for HMAC
-
-// Compute and compare
-HMAC(EVP_sha1(), key, strlen(key), header, 12, signature, &len);
 ```
 
 #### Connection drops after 30 seconds
@@ -2077,6 +2518,7 @@ The MN-740 reports firmware version in Type 0x02 handshake response at offset 13
 - Extra validation checks in TLV parser
 - Never released to production
 - Occasionally found on developer units
+- Aparently leaked in 2020 Xbox giga leak
 
 ### Detection in Code
 
@@ -2144,25 +2586,79 @@ void detect_firmware_version(const uint8_t *handshake_response) {
 | 0x0e | DISCOVERY_RESP | Adapter→Xbox | UDP:2002 | No | 40 bytes |
 
 ### TLV Tag Quick Reference
+tags are reused for different purposes depending on the frame type.
+**master global tag table**:
+```
+Tag ID  |   Name            | Size      |  Common In  |  Description
+--------|-------------------|-----------|-------------|-------------------
+0x01    |  IP               |  Var / 4  |  "02,05"  |  Type 02/05 it is the IP Address.
+0x01    |  SSID             |  Var / 4  |  "04,07"  |  Type 07/04 it is the SSID string
+0x02    |  Security         |  1        |  "04"  | Type 04 it is Security Type."
+0x02    |  State            |  1        |  "02"  |  "Type 02 it is Connection State (0=Disc  |   2=Conn).
+0x02    |  Terminator       |  1        |  "02,07"  |  End of Data: Always 02 01 00. Signals the parser to stop reading the TLV stream.
+0x03    |  Mode / Preamble  |  1        |  07  |  "In Ad-hoc  |   sets Wireless Mode (B/G). In Infra  |   sets Preamble Type."
+0x04    |  Op Mode / SSID   |  1 / Var  |  "02,07"  |  "In Type 02  |   it is Op Mode (1=Infra  |   2=Ad-Hoc). In Type 07  |   it is an SSID Mirror."
+0x05    |  Security / Chan  |  1        |  "04,07"  |  "In Type 07 Infra  |   sets Security Type. In Ad-hoc  |   sets the WiFi Channel."
+0x06    |  Signal / IP      |  1 / 4    |  "02,07"  |  "In Type 02  |   it is Signal Strength (0-255). In Type 07  |   it is the Static IP."
+0x07    |  Identity / Mask  |  Var / 4  |  "02,07"  |  "In Type 02  |   it is the SSID/Channel. In Type 07  |   it is the Subnet Mask."
+0x08    |  Gateway / Flag   |  4 / 1    |  07  |  "In Type 07  |   it is the Gateway IP or the 802.11 Capability Flag."
+0x09    |  Net Mode         |  1        |  07  |  "Defines Network Topology (1=Ad-hoc Open  |   4=Infrastructure)."
+0x0A    |  Password / Key   |  Var      |  "02,07"  |  Stores WiFi Password or WEP Key Slot 1.
+0x0B    |  BSSID / Key      |  6 / 5    |  "02,07"  |  "In Type 02  |   it is AP MAC. In Ad-hoc  |   it is WEP Key Slot 2."
+0x0C    |  WEP Key 3        |  5        |  07  |  Third WEP-64 key slot for Ad-hoc encryption.
+0x0D    |  WEP Key 4        |  5        |  07  |  Fourth WEP-64 key slot for Ad-hoc encryption.
+0x0E    |  Region / Index   |  1        |  07  |  Critical: Regulatory Region Code or Active WEP Key Index.
+0x0F    |  WEP-128 Key      |  13       |  07  |  Full 13-character ASCII key for WEP-128 security.
+0x10    |  WPA Stub         |  34       |  07  |  Parser Trap: 256-bit PMK. Must be skipped (34 bytes total).
+0x11    |  Commit Flag      |  1        |  07  |  Signals the adapter to save these settings to internal Flash.
+0x12    |  Region (Alt)     |  1        |  07  |  Alternate tag for the regulatory region.
+0x14    |  Clone MAC        |  6        |  07  |  Spoofed MAC address for ISP registration bypass.
+0x81    |  Router MAC       |  6        |  02  |  Extended Tag: The MAC address of the default gateway router.
+0x82    |  HW Revision      |  1        |  02  |  Extended Tag: Hardware revision of the radio chipset.
+0x83    |  uRamEB00         |  1        |  07  |  Internal firmware state/region flag.
+0x84    |  uRamEA05         |  1        |  07  |  Internal diagnostic flag.
+0x85    |  uRamEA06         |  1        |  07  |  Internal diagnostic flag.
+0x86+   |  Bulk Data        |  512      |  07  |  Flash/EEPROM dump. Allows reading 512-byte blocks.
 
-| Tag  | Name | Infrastructure | Ad-hoc | Size |
-|------|------|----------------|--------|------|
-| 0x01 | SSID | Yes | Yes | 1-32 |
-| 0x02 | Channel | Optional | **Mandatory** | 1 |
-| 0x03 | Wireless Mode | Optional | Optional | 1 |
-| 0x04 | SSID (alt) | Yes | No | 1-32 |
-| 0x06 | IP Address | Optional | Optional | 4 |
-| 0x07 | Subnet Mask | Optional | Optional | 4 |
-| 0x08 | Gateway | Optional | Optional | 4 |
-| 0x09 | Network Mode | Yes | Yes | 1 |
-| 0x0A | Password/WEP Key 1 | If secured | If WEP | Variable |
-| 0x0B | WEP Key 2 | No | If WEP | 5 |
-| 0x0C | WEP Key 3 | No | If WEP | 5 |
-| 0x0D | WEP Key 4 | No | If WEP | 5 |
-| 0x0E | WEP Key Index | No | If WEP | 1 |
-| 0x0F | WEP-128 Password | If WEP-128 | No | 13 |
-| 0x11 | Commit to Flash | Optional | Optional | 0 |
-| 0x12 | Region Code | Optional | Optional | 1 |
+Tag ID  |  Name  |  Size  |  Source / Logic in Code  |  Description
+0x01  |  IP Address  |  4  |  &CFG_Device_IP  |  Current local IP of the adapter.
+0x02  |  Conn State  |  1  |  cRam800ceba0  |  "0=Idle  |   1=Connecting  |   2=Connected."
+0x04  |  Op Mode  |  1  |  wlan_get_op_mode_flag()  |  "1=Infrastructure  |   2=Ad-Hoc."
+0x06  |  Signal  |  1  |  wlan_get_signal_strength()  |  RSSI (0-255).
+0x07  |  Identity  |  Var  |  hw_get_ssid_string()  |  Channel (1 byte) + SSID String.
+0x08  |  BSSID  |  6  |  wlan_get_current_bssid()  |  MAC of the connected Access Point.
+0x09  |  FUN_8BC4  |  1  |  FUN_80098bc4()  |  Unknown status flag (Possibly Link Speed).
+0x0E  |  FUN_8694  |  1  |  FUN_80098694()  |  Unknown status flag.
+0x11  |  Security  |  1  |  wlan_get_encryption_type()  |  "0=None  |   1=WEP  |   2=WPA  |   4=WPA2."
+0x81  |  Router MAC  |  6  |  &g_ROUTER_MAC_ADDRESS  |  BSSID of the Gateway/Router.
+0x82  |  HW Rev  |  1  |  hw_get_revision_id()  |  Hardware version of the radio.
+0x83  |  uRamEB00  |  1  |  uRam800ceb00  |  Internal firmware state/region flag.
+0x84  |  uRamEA05  |  1  |  uRam800cea05  |  Internal diagnostic flag.
+0x85  |  uRamEA06  |  1  |  uRam800cea06  |  Internal diagnostic flag.
+0x86+  |  Bulk Data  |  512  |  0x8024abc8  |  Flash/EEPROM dump. Allows reading 512-byte blocks.
+
+```
+
+| Tag  | Name             | Infrastructure | Ad-hoc | Size |
+|------|------------------|----------------|--------|------|
+| 0x01 | SSID             | Yes            | Yes    | 1-32 |
+| 0x02 | Channel          | Optional       | Mandatory| 1 |
+| 0x03 | Wireless Mode    | Optional       | Optional | 1 |
+| 0x04 | SSID (alt)       | Yes            | No       | 1-32 |
+| 0x06 | IP Address       | Optional       | Optional | 4 |
+| 0x07 | Subnet Mask      | Optional       | Optional | 4 |
+| 0x08 | Gateway          | Optional       | Optional | 4 |
+| 0x09 | Network Mode     | Yes            | Yes      | 1 |
+| 0x0A | Password/WEP Key 1 | If secured   | If WEP   | Variable |
+| 0x0B | WEP Key 2        | No             | If WEP   | 5 |
+| 0x0C | WEP Key 3        | No             | If WEP   | 5 |
+| 0x0D | WEP Key 4        | No             | If WEP   | 5 |
+| 0x0E | WEP Key Index    | No             | If WEP   | 1 |
+| 0x0F | WEP-128 Password | If WEP-128     | No       | 13 |
+| 0x11 | Commit to Flash  | Optional       | Optional | 0 |
+| 0x12 | Region Code      | Optional       | Optional | 1 |
+
+
 
 ### Network Mode Values (Tag 0x09)
 
@@ -2200,6 +2696,13 @@ Offset 252-255 (0xFC): 02 01 00 00        ✓ Connected status
 ❌ **Wrong**: Assuming signal is always 0-255 scale  
 ✅ **Correct**: Type 0x02 uses 0-255, Type 0x06 uses 0-100
 
+###Quirky error handler string
+
+the device has a very funny error handling string as a line from the
+three stooges that is common on other dlink products:
+
+"Hey Moe, it dont woik. NYUK NYUK NYUK NYUK"
+
 ---
 
 ## Document History
@@ -2218,7 +2721,7 @@ Offset 252-255 (0xFC): 02 01 00 00        ✓ Connected status
 
 **v3.0**
 - Ad-hoc mode protocol confirmed
-- Tag 0x02 = WiFi channel discovery
+- Tag 0x02 = Wi-Fi channel discovery
 - TLV tag complete reference
 
 **v2.2**
@@ -2229,3 +2732,5 @@ Offset 252-255 (0xFC): 02 01 00 00        ✓ Connected status
 - Initial protocol documentation
 
 ---
+**All reverse engineering was based on firmware version v1.0.2.26 using Ghidra v12**
+**signed off by jonathan Brophy <Professor_jonny@hotmail.com**
